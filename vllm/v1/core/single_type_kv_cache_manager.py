@@ -995,44 +995,122 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             kv_cache_spec.sliding_window, kv_cache_spec.block_size, drop_eagle_block
         )
 
-        # TODO: reduce i by sliding_window_contiguous_blocks when cache miss, to
-        # optimize the time complexity from O(max_num_blocks) to
-        # O(max_num_blocks / sliding_window_contiguous_blocks +
-        # sliding_window_contiguous_blocks),
-        # which is good for low cache hit rate scenarios.
+        # A full hit needs a run of `sliding_window_contiguous_blocks`
+        # consecutive cached blocks ending anywhere in the request. Instead of
+        # scanning every block, probe one block per stride from the right:
+        # every candidate run of `stride` consecutive blocks contains exactly
+        # one probe position, so a probe miss rules out all runs through it
+        # and the scan can skip a whole stride (#62336). On a probe hit, the
+        # run is reconstructed by expanding right (bounded: the next probe to
+        # the right missed or is out of range) and left (unbounded: the run
+        # may be longer than one stride). When blocks must stay aligned to a
+        # finer hybrid-cache grid (`block_size != alignment_tokens`), keep the
+        # original per-block scan: its alignment-continue path does not break
+        # runs, which the probe lattice cannot express.
         max_num_blocks = max_length // kv_cache_spec.block_size
         computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
             [block_pool.null_block] * max_num_blocks
             for _ in range(len(kv_cache_group_ids))
         )
         block_size = kv_cache_spec.block_size
+        if block_size == alignment_tokens:
+            stride = max(sliding_window_contiguous_blocks, 1)
+        else:
+            stride = 1
         num_contiguous_blocks = 0
         match_found = False
-        # Search from right to left and early stop when a match is found.
-        for i in range(max_num_blocks - 1, -1, -1):
-            if cached_block := block_pool.get_cached_block(
-                block_hashes[i], kv_cache_group_ids
-            ):
-                # Skip prefix matching check if the block is not aligned with
-                # `alignment_tokens`.
-                if num_contiguous_blocks == 0 and block_size != alignment_tokens:
-                    post_pop_blocks = i if drop_eagle_block else i + 1
-                    if (post_pop_blocks * block_size) % alignment_tokens != 0:
-                        continue
-                # Add the cached block to the computed blocks.
+        if stride == 1:
+            # Original per-block scan (unaligned blocks or window of one
+            # block): unchanged behavior.
+            for i in range(max_num_blocks - 1, -1, -1):
+                if cached_block := block_pool.get_cached_block(
+                    block_hashes[i], kv_cache_group_ids
+                ):
+                    # Skip prefix matching check if the block is not aligned
+                    # with `alignment_tokens`.
+                    if num_contiguous_blocks == 0 and block_size != alignment_tokens:
+                        post_pop_blocks = i if drop_eagle_block else i + 1
+                        if (post_pop_blocks * block_size) % alignment_tokens != 0:
+                            continue
+                    # Add the cached block to the computed blocks.
+                    for computed, cached in zip(computed_blocks, cached_block):
+                        computed[i] = cached
+                    num_contiguous_blocks += 1
+                    if num_contiguous_blocks >= sliding_window_contiguous_blocks:
+                        # Trim the trailing blocks.
+                        # E.g., [NULL, NULL, 8, 3, NULL, 9] -> [NULL, NULL, 8, 3]
+                        # when sliding_window_contiguous_blocks=2.
+                        for computed in computed_blocks:
+                            del computed[i + num_contiguous_blocks :]
+                        match_found = True
+                        break
+                else:
+                    num_contiguous_blocks = 0
+        else:
+            # Probe lattice scan. A probe hit rebuilds its run by expanding
+            # right (bounded by the missed probe above) and left (unbounded).
+            i = max_num_blocks - 1
+            while i >= 0:
+                cached_block = block_pool.get_cached_block(
+                    block_hashes[i], kv_cache_group_ids
+                )
+                if cached_block is None:
+                    i -= stride
+                    continue
+                # Add the probe block to the computed blocks.
                 for computed, cached in zip(computed_blocks, cached_block):
                     computed[i] = cached
-                num_contiguous_blocks += 1
+                # Expand right (at most stride - 1: the next probe to the
+                # right missed or is beyond the request).
+                run_end = i + 1
+                while run_end < min(i + stride, max_num_blocks) and (
+                    cached_r := block_pool.get_cached_block(
+                        block_hashes[run_end], kv_cache_group_ids
+                    )
+                ):
+                    for computed, cached in zip(computed_blocks, cached_r):
+                        computed[run_end] = cached
+                    run_end += 1
+                num_contiguous_blocks = run_end - i
                 if num_contiguous_blocks >= sliding_window_contiguous_blocks:
-                    # Trim the trailing blocks.
-                    # E.g., [NULL, NULL, 8, 3, NULL, 9] -> [NULL, NULL, 8, 3]
-                    # when sliding_window_contiguous_blocks=2.
                     for computed in computed_blocks:
-                        del computed[i + num_contiguous_blocks :]
+                        del computed[run_end:]
                     match_found = True
                     break
-            else:
+                # Expand left while cached; the run may span many strides.
+                l = i - 1
+                while l >= 0 and (
+                    cached_l := block_pool.get_cached_block(
+                        block_hashes[l], kv_cache_group_ids
+                    )
+                ):
+                    for computed, cached in zip(computed_blocks, cached_l):
+                        computed[l] = cached
+                    num_contiguous_blocks += 1
+                    if num_contiguous_blocks >= sliding_window_contiguous_blocks:
+                        for computed in computed_blocks:
+                            del computed[l + num_contiguous_blocks :]
+                        match_found = True
+                        break
+                    l -= 1
+                if match_found:
+                    break
+                # Resume probing below the run we just walked.
+                i = (l if l >= 0 else i) - stride
+            if not match_found:
+                # No full-window run: report the leftmost run, matching the
+                # residual num_contiguous_blocks of the right-to-left scan.
+                # The probe lattice does not necessarily land on it, so walk
+                # it from block 0 and fill the computed blocks as we go.
                 num_contiguous_blocks = 0
+                while num_contiguous_blocks < max_num_blocks and (
+                    cached_block := block_pool.get_cached_block(
+                        block_hashes[num_contiguous_blocks], kv_cache_group_ids
+                    )
+                ):
+                    for computed, cached in zip(computed_blocks, cached_block):
+                        computed[num_contiguous_blocks] = cached
+                    num_contiguous_blocks += 1
         if not match_found:
             # The first `num_contiguous_blocks` is a cache hit even if
             # `num_contiguous_blocks < sliding_window_contiguous_blocks`.
